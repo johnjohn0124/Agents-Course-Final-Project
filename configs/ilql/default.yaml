@@ -1,0 +1,63 @@
+model_name: gpt2
+run_name: DEBUG-RUN-NAME
+run_group_name: DEBUG-GROUP
+task: twenty-questions
+data_path: "./input_data/{task}"
+
+saving:
+  save_basedir: "./checkpoints/{task}/ilql"
+  save_freq: 10000
+  eval_freq: 5000
+  use_wandb: True
+  save_model: True
+
+training:
+  n_epochs: 4
+  gradient_accum_steps: 64
+  lr: 2.0e-5
+  lora_r: 16
+  lora_alpha: 32
+  gamma: 0.999
+  cql_loss_coeff: 0.005
+  mc_loss_coeff: 0.0
+  polyak_coeff: 0.05
+  data_seed: 42
+  seed: 42
+  train_data_diet: 1000
+  val_data_diet: 100
+
+reward:
+  # GROUP of how final reward is distributed
+  # if True, put 1 for success and 0 for failure. otherwise use task-specific sequence reward
+  use_zero_one_reward: True
+  # NOTE: the next three are mutually exclusive
+  # if True, just put the reward at the very end of the sequence
+  use_sparse_reward: True
+  # if True, distribute the reward evenly at the end of each utterance
+  use_uniform_reward: False
+  # if True, do not use the base reward
+  no_base_reward: False
+
+  # take the absolute value of the total reward and distribute that much intrinsic reward
+  llm_guidance_coeff: 1.0
+  # use the LLM scores to distribute a zero-one reward
+
+  # temperature for guidance
+  llm_guidance_temp: 3.0
+
+  # if True
+  use_conditional_llm_reward: False
+  # if True, regress to the LLM rewards alone (NOTE: this should likely fail)
+  use_unconditional_llm_reward: False
+  # no llm reward in this case
+  no_llm_reward: True
+
+  # reward type: [prefix, sequence, cot]
+  llm_reward_type:
+
+  # if TRUE, overrides all and does training with a prefix-conditioned reward.
+  # also masks out rewards in assistant turns, which keeps the reward single-step.
+  # because there's no extrinsic reward, there's really only one reward shaping setup (excluding gamma)
+  use_blocked_prefix_reward: False
+
+  specified: True

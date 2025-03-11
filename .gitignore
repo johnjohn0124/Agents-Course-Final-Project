@@ -1,0 +1,4 @@
+**checkpoints/
+wandb/
+**__pycache__/
+input_data/guess-my-city/
