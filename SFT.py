@@ -149,13 +149,25 @@ def evaluate_sft_reward_model(model, eval_path, tokenizer, device="cuda"):
 import os
 import json
 import random
+import torch
 
 def load_data_subset(data_path, subset_size):
-    """Loads a subset of the dataset."""
     with open(data_path, "r") as f:
         data = json.load(f)
-    random.shuffle(data)  # Shuffle to get a diverse subset
-    return data[:subset_size]  # Return only the required subset
+    random.shuffle(data)  
+    return data[:subset_size]  
+
+def compute_pairwise_agreement(all_rewards):
+    n = all_rewards.shape[0] 
+    pairwise_agreement = 0
+    count = 0
+
+    for i in range(n):
+        for j in range(i + 1, n):  # Compare every pair (i, j)
+            pairwise_agreement += (all_rewards[i] > 0.5).eq(all_rewards[j] > 0.5).float().mean().item()
+            count += 1
+
+    return pairwise_agreement / count if count > 0 else 0  # Normalize by number of pairs
 
 def run_sft_experiments(
     seeds=[42, 43, 44], 
@@ -190,7 +202,7 @@ def run_sft_experiments(
                 checkpoint_path = f"{save_dir}/{model_name}_seed{seed}_data{data_size}.pth"
 
                 # Initialize model
-                model = SFTRewardModel(model_name)
+                model = SFTRewardModel(model_name).to("cuda" if torch.cuda.is_available() else "cpu")
 
                 # **Check if checkpoint exists to resume training**
                 if os.path.exists(checkpoint_path):
@@ -207,19 +219,24 @@ def run_sft_experiments(
 
                 # Evaluate model
                 print(f"Evaluating {model_name} with seed {seed} on {data_size} samples...")
-                eval_metrics = evaluate_sft_reward_model(model, EVAL_PATH, tokenizer)
+                all_rewards = evaluate_sft_reward_model(model, EVAL_PATH, tokenizer)
+
+                # Compute variance and pairwise agreement
+                variance = all_rewards.var().item()
+                agreement = compute_pairwise_agreement(all_rewards)
 
                 # Store results
                 results.append({
                     "model": model_name,
                     "seed": seed,
                     "data_size": data_size,
-                    "variance": eval_metrics["variance"],
-                    "agreement": eval_metrics["agreement"],
+                    "variance": variance,
+                    "agreement": agreement,
                 })
 
     print("All experiments completed!")
     return results
+
 
 
 
