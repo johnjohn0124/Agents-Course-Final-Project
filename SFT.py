@@ -1,9 +1,11 @@
+import pdb
 import os
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
+import numpy as np
 import json
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
@@ -58,10 +60,9 @@ class SFTRewardModel(nn.Module):
     def forward(self, input_ids, attention_mask=None):
         outputs = self.model(input_ids, attention_mask=attention_mask, output_hidden_states=True)
         last_hidden_state = outputs.hidden_states[-1]
-        reward = self.reward_head(last_hidden_state[:, -1, :])
+        # output: [B, T, 1]
+        reward = self.reward_head(last_hidden_state[:, :, :])
         return reward.squeeze(-1)  # Output shape: (batch_size,)
-
-
 
 
 def train_sft_reward_model(model, train_path, val_path, tokenizer, best_path, epochs=3, batch_size=4, lr=2e-5, device="cuda"):
@@ -75,7 +76,7 @@ def train_sft_reward_model(model, train_path, val_path, tokenizer, best_path, ep
 
     model.to(device)
     optimizer = optim.AdamW(model.parameters(), lr=lr)
-    criterion = nn.BCEWithLogitsLoss()  # Binary classification loss
+    criterion = nn.BCEWithLogitsLoss(reduction='none')  # Binary classification loss
 
     best_val_loss = float('inf')
 
@@ -88,9 +89,16 @@ def train_sft_reward_model(model, train_path, val_path, tokenizer, best_path, ep
             attention_mask = batch["attention_mask"].to(device)
             rewards = batch["reward"].to(device)
 
+            # the pad token id
+            rewards_mask = (input_ids != 50256)
+            rewards_expanded = rewards.unsqueeze(1).expand(-1, input_ids.shape[1]).float()
+
             optimizer.zero_grad()
             predicted_rewards = model(input_ids, attention_mask)
-            loss = criterion(predicted_rewards, rewards)
+
+            loss_unmasked = criterion(predicted_rewards, rewards_expanded)
+            loss_masked = loss_unmasked * rewards_mask.float()
+            loss = loss_masked.sum() / rewards_mask.float().sum()
             loss.backward()
             optimizer.step()
 
@@ -141,15 +149,22 @@ def evaluate_sft_reward_model(model, eval_path, tokenizer, device="cuda"):
     all_rewards = []
 
     with torch.no_grad():
-        for batch in eval_loader:
+        i = 0
+        for batch in tqdm(eval_loader):
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
             predicted_rewards = model(input_ids, attention_mask).cpu().numpy()
             all_rewards.append(predicted_rewards)
+            i += 1
+            if i == 5:
+                break
 
-    all_rewards = torch.tensor(all_rewards).flatten()
+    all_rewards = np.array(all_rewards)
+    all_rewards = torch.from_numpy(all_rewards).permute(1, 0, 2).squeeze(dim=0)
     variance = all_rewards.var().item()
-    agreement = (all_rewards > 0.5).float().mean().item()
+    # agreement = compute_pairwise_agreement(all_rewards)
+    # the metric as it's implemented is currently useless and expensive
+    agreement = 0.
 
     print(f"Reward Estimate Variance: {variance:.4f}")
     print(f"Reward Estimate Agreement: {agreement:.4f}")
@@ -161,14 +176,26 @@ def evaluate_sft_reward_model(model, eval_path, tokenizer, device="cuda"):
 import os
 import json
 import random
+import torch
 
 def load_data_subset(data_path, subset_size, seed):
-    """Loads a subset of the dataset."""
     with open(data_path, "r") as f:
         data = json.load(f)
     random.seed(seed)
-    random.shuffle(data)  # Shuffle to get a diverse subset
-    return data[:subset_size]  # Return only the required subset
+    random.shuffle(data)  
+    return data[:subset_size]  
+
+def compute_pairwise_agreement(all_rewards):
+    n = all_rewards.shape[0] 
+    pairwise_agreement = 0
+    count = 0
+
+    for i in range(n):
+        for j in range(i + 1, n):  # Compare every pair (i, j)
+            pairwise_agreement += (all_rewards[i] > 0.5).eq(all_rewards[j] > 0.5).float().mean().item()
+            count += 1
+
+    return pairwise_agreement / count if count > 0 else 0  # Normalize by number of pairs
 
 def run_sft_experiments(
     seeds=[42, 43, 44], 
@@ -201,41 +228,52 @@ def run_sft_experiments(
                     json.dump(train_data_subset, f)
 
                 # Define checkpoint path
-                checkpoint_path = f"{save_dir}/{model_name}_seed{seed}_data{data_size}_final.pth"
+                final_path = f"{save_dir}/{model_name}_seed{seed}_data{data_size}_final.pth"
                 best_path = f"{save_dir}/{model_name}_seed{seed}_data{data_size}_best.pth"
 
                 # Initialize model
-                model = SFTRewardModel(model_name)
+                model = SFTRewardModel(model_name).to("cuda" if torch.cuda.is_available() else "cpu")
 
                 # **Check if checkpoint exists to resume training**
-                if os.path.exists(checkpoint_path):
-                    print(f"Loading checkpoint for {model_name} with seed {seed} and data size {data_size}...")
-                    model.load_state_dict(torch.load(checkpoint_path))
-                    model.eval()
+                if not os.path.exists(best_path):
+                    train_sft_reward_model(model, train_subset_path, VAL_PATH, tokenizer, epochs=epochs, best_path=best_path)
+                    torch.save(model.state_dict(), final_path)
+                    print(f"Checkpoint saved at: {final_path}")
 
-                # Train model on dataset subset
-                train_sft_reward_model(model, train_subset_path, VAL_PATH, tokenizer, epochs=epochs, best_path=best_path)
+                print(f"Loading checkpoint for {model_name} with seed {seed} and data size {data_size}...")
+                model.load_state_dict(torch.load(best_path))
+                model.eval()
 
                 # **Save model checkpoint after training**
-                torch.save(model.state_dict(), checkpoint_path)
-                print(f"Checkpoint saved at: {checkpoint_path}")
 
                 # Evaluate model
                 print(f"Evaluating {model_name} with seed {seed} on {data_size} samples...")
-                eval_metrics = evaluate_sft_reward_model(model, EVAL_PATH, tokenizer)
+                all_rewards = evaluate_sft_reward_model(model, EVAL_PATH, tokenizer)
+
+                # Compute variance and pairwise agreement
+                variance = all_rewards['variance']
+                agreement = all_rewards['agreement']
 
                 # Store results
                 results.append({
                     "model": model_name,
                     "seed": seed,
                     "data_size": data_size,
-                    "variance": eval_metrics["variance"],
-                    "agreement": eval_metrics["agreement"],
+                    "variance": variance,
+                    "agreement": agreement,
                 })
+
+                with open('sft_results.json', 'w') as f:
+                    json.dump(results, f)
 
     print("All experiments completed!")
     return results
 
 
 
-experiment_results = run_sft_experiments()
+
+if __name__=="__main__":
+    experiment_results = run_sft_experiments()
+    with open('sft_results.json', 'w') as f:
+        json.dump(experiment_results, f)
+
