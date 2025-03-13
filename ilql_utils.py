@@ -153,7 +153,7 @@ class ILQLModel(nn.Module):
                 tau=0.7,
                 cql_loss_coeff=0.005,
                 cql_temp=1.0,
-                q_head_bias=-25.0):
+                q_head_bias=None):
         super().__init__()
 
         if checkpoint_dir is not None:
@@ -211,6 +211,9 @@ class ILQLModel(nn.Module):
 
     def get_all_values(self, *args, **kwargs):
         outputs = self.backbone_lm(*args, output_hidden_states=True, **kwargs)
+        if self.q_head_bias in [None, "None"]:
+            self.q_head_bias = -(outputs['logits'].mean().cpu().item())
+
         last_hidden_states = outputs.hidden_states[-1]
 
         q_vals = self.q_head(last_hidden_states) + self.q_head_bias
@@ -693,19 +696,19 @@ def train_ilql(config):
                     cql_loss_coeff=config.training.cql_loss_coeff,
                     mc_loss_coeff=config.training.mc_loss_coeff,
                     polyak_coeff=config.training.polyak_coeff,
-                    gamma=config.training.gamma)
+                    gamma=config.training.gamma,
+                    q_head_bias=config.training.head_bias)
 
     print('MODEL LOADED')
 
     config_dict = OmegaConf.to_container(config, resolve=True)
 
 
-    wandb.init(project='agents',
-            name=config.run_name,
-            mode='online' if config.saving.use_wandb else 'disabled',
-            config=config_dict)
-
     if config.saving.use_wandb:
+        wandb.init(project='agents',
+                name=config.run_name,
+                mode='online',
+                config=config_dict)
         wandb.watch(ilql)
 
     optimizer = torch.optim.Adam(ilql.parameters(), lr=config.training.lr)
@@ -714,6 +717,8 @@ def train_ilql(config):
     i = 0
 
     optimizer.zero_grad()
+
+
 
     def eval_loop(ilql, val_dl, tokenizer):
         ilql.eval()
@@ -743,7 +748,9 @@ def train_ilql(config):
         ilql.train()
         return out_logs
 
-    for _ in range(config.training.n_epochs):
+    best_val_loss = float('inf')
+
+    for epoch in range(config.training.n_epochs):
         ilql.train()
 
         pbar = tqdm(train_dl, total=len(train))
@@ -768,7 +775,17 @@ def train_ilql(config):
             if i % config.saving.eval_freq == 0:
                 print('EVALUATING')
                 eval_logs = eval_loop(ilql, val_dl, tokenizer)
-                wandb.log(eval_logs)
+                if config.saving.use_wandb:
+                    wandb.log(eval_logs)
+                
+                if eval_logs['loss_val'] < best_val_loss:
+                    save_path = os.path.join(config.saving.save_dir, f'best_checkpoint')
+
+                    with open(os.path.join(config.saving.save_dir, 'best_epoch.txt'), 'w') as f:
+                        f.write(f"BEST EPOCH:\n{epoch + 1}\n")
+                        f.write(f"BEST LOSS:\n{eval_logs['loss_val']}\n")
+                    
+                    ilql.save_checkpoint(save_path)
             
             loss, logs = ilql.get_loss(traj, log_values=(i % 100 == 0))
 
@@ -779,7 +796,8 @@ def train_ilql(config):
             loss_scaled = loss / config.training.gradient_accum_steps
             loss_scaled.backward()
 
-            wandb.log(logs)
+            if config.saving.use_wandb:
+                wandb.log(logs)
             pbar.set_description(f'Loss: {loss.item():.4f}')
 
             # saving logic
@@ -790,7 +808,15 @@ def train_ilql(config):
 
 
         eval_logs = eval_loop(ilql, val, tokenizer)
-        wandb.log(eval_logs)
+
+        if eval_logs['loss_val'] < best_val_loss:
+            save_path = os.path.join(config.saving.save_dir, f'best_checkpoint')
+
+            with open(os.path.join(config.saving.save_dir, 'best_epoch.txt'), 'w') as f:
+                f.write(f"BEST EPOCH:\n{epoch + 1}\n")
+                f.write(f"BEST LOSS:\n{eval_logs['loss_val']}\n")
+            
+            ilql.save_checkpoint(save_path)
 
     save_path = os.path.join(config.saving.save_dir, f'final_checkpoint')
     ilql.save_checkpoint(save_path)
