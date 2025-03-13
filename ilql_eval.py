@@ -1,5 +1,6 @@
-import json
 import os
+os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+import json
 import numpy as np
 import random
 import pdb
@@ -18,7 +19,7 @@ from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from ilql_utils import ILQLModel, Trajectory
 
-def evaluate_value_predictions(model_path, val_data_path, output_path, config_path):
+def evaluate_value_predictions(model_path, val_data_path, output_basedir, config_path):
     """
     Evaluate value function predictions from a trained ILQL model.
     
@@ -66,7 +67,15 @@ def evaluate_value_predictions(model_path, val_data_path, output_path, config_pa
         trajectory_id = f"{trajectory.secret}_{idx}"
         
         # Get V values for the entire trajectory
-        vs, tokens = ilql_model.observe_v_values(trajectory, tokenizer)
+        trajectory_data = ilql_model.prepare_trajectory_data(trajectory)
+        model_inputs = trajectory_data['model_inputs']
+        all_values = ilql_model.get_all_values(**model_inputs)
+        vs = all_values['v']
+        qs_all = all_values['q']
+        tokens = trajectory_data['tokens']
+        qs = ilql_model.select_qs(qs_all, tokens, trajectory)
+
+        # vs, tokens = ilql_model.observe_v_values(trajectory, tokenizer)
         
         # Extract turn-level predictions
         turn_predictions = []
@@ -74,16 +83,18 @@ def evaluate_value_predictions(model_path, val_data_path, output_path, config_pa
         # Get positions at the end of assistant turns
         assistant_eot_idxs = trajectory.assistant_eot_idxs
         
-        
         valid_predictions = 0
         # Extract V values at these positions
         for i, pos in enumerate(assistant_eot_idxs):
             if pos < vs.shape[1]:  # Make sure position is within bounds
                 v_at_turn = vs[0, pos, 0].item()  # Get scalar value
+                q_at_turn = qs[0, pos, 0].item()
                 turn_predictions.append({
                     'turn_idx': i,
                     'token_pos': pos,
                     'v_value': v_at_turn,
+                    'q_value': q_at_turn,
+                    'adv': q_at_turn - v_at_turn,
                     'predicted_success': v_at_turn > 0  # Binary prediction
                 })
                 valid_predictions += 1
@@ -101,6 +112,8 @@ def evaluate_value_predictions(model_path, val_data_path, output_path, config_pa
         results.append(result)
     
     # Save results
+    os.makedirs(output_basedir, exist_ok=True)
+    output_path = os.path.join(output_basedir, 'results.json')
     with open(output_path, 'w') as f:
         json.dump(results, f, indent=2)
     
@@ -159,7 +172,7 @@ def run_evaluations(config, val_data_path):
     model_scales = ["gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl"]
     data_diets = [100]
     
-    results_dir = "./evaluation_results"
+    results_dir = "./ilql_evaluation_results"
     os.makedirs(results_dir, exist_ok=True)
     
     for seed in seeds:
@@ -211,8 +224,10 @@ def compute_cross_run_metrics(results_dir):
             }
     
     # Compute variance and agreement metrics
-    variance_by_turn = {}
-    agreement_by_turn = {}
+    v_variance_by_turn = {}
+    v_agreement_by_turn = {}
+    q_variance_by_turn = {}
+    q_agreement_by_turn = {}
     
     for traj_id, traj_data in trajectory_predictions.items():
         # Skip trajectories that don't appear in all runs
@@ -221,58 +236,97 @@ def compute_cross_run_metrics(results_dir):
             
         # Get predictions at each turn across runs
         for turn_idx in range(20):  # Assuming up to 20 turns
-            values_at_turn = []
+            vs_at_turn = []
+            qs_at_turn = []
             
             for run_name, run_data in traj_data['runs'].items():
                 # Find prediction for this turn if it exists
                 for pred in run_data['turn_predictions']:
                     if pred['turn_idx'] == turn_idx:
-                        values_at_turn.append(pred['v_value'])
+                        vs_at_turn.append(pred['v_value'])
+                        qs_at_turn.append(pred['q_value'])
                         break
             
-            if values_at_turn:
+            if vs_at_turn:
                 # Compute variance
-                if turn_idx not in variance_by_turn:
-                    variance_by_turn[turn_idx] = []
+                if turn_idx not in v_variance_by_turn:
+                    v_variance_by_turn[turn_idx] = []
+                    q_variance_by_turn[turn_idx] = []
+
                 
-                variance = np.var(values_at_turn)
-                variance_by_turn[turn_idx].append(variance)
+                v_variance = np.var(vs_at_turn)
+                q_variance = np.var(qs_at_turn)
+                v_variance_by_turn[turn_idx].append(v_variance)
+                q_variance_by_turn[turn_idx].append(q_variance)
                 
                 # Compute agreement (% of pairs that agree on binary prediction)
-                binary_preds = [v > 0 for v in values_at_turn]
-                agreements = 0
+                v_binary_preds = [v > 0 for v in vs_at_turn]
+                q_binary_preds = [q > 0 for v in vs_at_turn]
+                v_agreements = 0
+                q_agreements = 0
                 total_pairs = 0
                 
-                for i in range(len(binary_preds)):
-                    for j in range(i+1, len(binary_preds)):
-                        agreements += binary_preds[i] == binary_preds[j]
+                for i in range(len(v_binary_preds)):
+                    for j in range(i+1, len(v_binary_preds)):
+                        v_agreements += v_binary_preds[i] == v_binary_preds[j]
+                        q_agreements += q_binary_preds[i] == q_binary_preds[j]
                         total_pairs += 1
                 
-                agreement_rate = agreements / total_pairs if total_pairs > 0 else float('nan')
+                v_agreement_rate = v_agreements / total_pairs if total_pairs > 0 else float('nan')
+                q_agreement_rate = q_agreements / total_pairs if total_pairs > 0 else float('nan')
                 
-                if turn_idx not in agreement_by_turn:
-                    agreement_by_turn[turn_idx] = []
+                if turn_idx not in v_agreement_by_turn:
+                    v_agreement_by_turn[turn_idx] = []
+                    q_agreement_by_turn[turn_idx] = []
                 
-                agreement_by_turn[turn_idx].append(agreement_rate)
+                v_agreement_by_turn[turn_idx].append(v_agreement_rate)
+                q_agreement_by_turn[turn_idx].append(q_agreement_rate)
     
     # Average metrics across trajectories
-    avg_variance_by_turn = {
+    v_avg_variance_by_turn = {
         turn: sum(variances) / len(variances)
-        for turn, variances in variance_by_turn.items()
+        for turn, variances in v_variance_by_turn.items()
+    }
+
+    q_avg_variance_by_turn = {
+        turn: sum(variances) / len(variances)
+        for turn, variances in q_variance_by_turn.items()
     }
     
-    avg_agreement_by_turn = {
+    v_avg_agreement_by_turn = {
         turn: sum(agreements) / len(agreements)
-        for turn, agreements in agreement_by_turn.items()
+        for turn, agreements in v_agreement_by_turn.items()
+    }
+
+    q_avg_agreement_by_turn = {
+        turn: sum(agreements) / len(agreements)
+        for turn, agreements in q_agreement_by_turn.items()
     }
     
     # Save cross-run metrics
     cross_run_metrics = {
-        'variance_by_turn': avg_variance_by_turn,
-        'agreement_by_turn': avg_agreement_by_turn
+        'v_variance_by_turn': v_avg_variance_by_turn,
+        'v_agreement_by_turn': v_avg_agreement_by_turn,
+        'q_variance_by_turn': q_avg_variance_by_turn,
+        'q_agreement_by_turn': q_avg_agreement_by_turn,
     }
     
     with open(os.path.join(results_dir, "cross_run_metrics.json"), 'w') as f:
         json.dump(cross_run_metrics, f, indent=2)
     
     return cross_run_metrics
+
+if __name__=="__main__":
+    # def compute_metrics(results, output_path):
+    # def run_evaluations(config, val_data_path):
+    # val_data_path = 'input_data/twenty-questions/eval_transformed.json'
+    # def evaluate_value_predictions(model_path, val_data_path, output_path, config_path):
+    # config = 
+    # config_path = 
+    checkpoint_dir = './checkpoints/twenty-questions/ilql/data_diet_sweep/diet-100/seed-0/'
+    model_path = os.path.join(checkpoint_dir, 'best_checkpoint')
+    config_path = os.path.join(checkpoint_dir, 'config.yaml')
+    val_data_path = './input_data/twenty-questions/eval_transformed.json'
+    output_basedir = './ilql_results/DEBUG'
+
+    evaluate_value_predictions(model_path, val_data_path, output_basedir, config_path)
