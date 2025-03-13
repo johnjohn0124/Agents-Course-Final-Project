@@ -41,19 +41,30 @@ class Trajectory:
         self.secret = self.data_d['secret']
 
         self.tokenizer = tokenizer
-        self.eot_id = self.tokenizer.eos_token_id
 
+        self._eot_id = None
         self._string = None
         self._tokens = None
         self._user_eot_idxs = None
         self._assistant_eot_idxs = None
         
+        self._eot_id = self.eot_id
         self._string = self.string
         self._tokens = self.tokens
         self.n_tokens = len(self.tokens)
         self._user_eot_idxs = self.user_eot_idxs
         self._assistant_eot_idxs = self.assistant_eot_idxs
 
+    @property
+    def eot_id(self):
+        if self._eot_id is None:
+            if self.tokenizer.chat_template is None:
+                eot_id = self.tokenizer.encode('\n')[0]
+            else:
+                eot_id = self.tokenizer.eos_token_id
+            self._eot_id = eot_id
+        return self._eot_id
+    
     @property
     def string(self):
         if self._string is None:
@@ -69,7 +80,7 @@ class Trajectory:
             
             message_str = apply_chat_template(messages, self.tokenizer)
             
-            self._string = message_str.strip()
+            self._string = message_str
         return self._string
 
     @property
@@ -157,7 +168,7 @@ class ILQLModel(nn.Module):
         super().__init__()
 
         if checkpoint_dir is not None:
-            self.backbone_lm = PeftModel.from_pretrained(self.backbone_lm,
+            self.backbone_lm = PeftModel.from_pretrained(backbone_lm,
                                                          os.path.join(checkpoint_dir, 'backbone_lm'))
 
         if peft_config is None:
@@ -818,6 +829,9 @@ def train_ilql(config):
             
             ilql.save_checkpoint(save_path)
 
+    config_path = os.path.join(config.saving.save_dir, f'config.yaml')
+    with open(config_path, 'w') as f:
+        OmegaConf.save(config, f)
     save_path = os.path.join(config.saving.save_dir, f'final_checkpoint')
     ilql.save_checkpoint(save_path)
-
+    wandb.finish()

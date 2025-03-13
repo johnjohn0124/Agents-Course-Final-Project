@@ -1,5 +1,5 @@
 model_name: gpt2
-run_name: DEBUG-RUN-NAME
+run_name: gpt2_42_100
 run_group_name: DEBUG-GROUP
 task: twenty-questions
 data_path: "./input_data/{task}"
