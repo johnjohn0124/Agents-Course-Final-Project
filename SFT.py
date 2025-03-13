@@ -30,7 +30,8 @@ class RewardDataset(Dataset):
 
     def __getitem__(self, idx):
         traj = self.data[idx]
-        text = " ".join(traj["turns"])
+        # eot token id will be \n
+        text = "\n".join(traj["turns"])
         reward = float(traj["guessed"])  # Binary reward: 1 if guessed correctly, else 0
 
         # Tokenize input
@@ -118,6 +119,7 @@ def train_sft_reward_model(model, train_path, val_path, tokenizer, best_path, ep
         total_val_loss = 0
 
         with torch.no_grad():
+            i = 0
             for batch in tqdm(val_loader):
                 input_ids = batch["input_ids"].to(device)
                 attention_mask = batch["attention_mask"].to(device)
@@ -126,6 +128,10 @@ def train_sft_reward_model(model, train_path, val_path, tokenizer, best_path, ep
                 predicted_rewards = model(input_ids, attention_mask)
                 loss = get_loss(input_ids, rewards, predicted_rewards)
                 total_val_loss += loss.item()
+
+                i += 1
+                if i > 5:
+                    break
 
         avg_val_loss = total_val_loss / len(val_loader)
 
@@ -153,25 +159,44 @@ def evaluate_sft_reward_model(model, eval_path, tokenizer, device="cuda"):
 
     all_rewards = []
 
+    eot_results = []
+
     with torch.no_grad():
+        i = 0
         for batch in tqdm(eval_loader):
+            i += 1
+
+            if i > 10:
+                break
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
-            predicted_rewards = model(input_ids, attention_mask).cpu().numpy()
+            predicted_rewards = model(input_ids, attention_mask).squeeze().cpu().numpy()
+            eot_idxs = torch.argwhere(input_ids.squeeze() == 198).squeeze()
+
+            eot_rewards = [predicted_rewards[i] for i in eot_idxs]
+            true_reward = batch['reward'].cpu().item()
+
+            acc = np.mean((np.array(eot_rewards) > 0.5) == int(true_reward))
+            var = np.var(true_reward)
+
             all_rewards.append(predicted_rewards)
 
-    all_rewards = np.array(all_rewards)
-    all_rewards = torch.from_numpy(all_rewards).permute(1, 0, 2).squeeze(dim=0)
-    variance = all_rewards.var().item()
-    # agreement = compute_pairwise_agreement(all_rewards)
-    # the metric as it's implemented is currently useless and expensive
-    agreement = 0.
+            eot_results.append(
+                {
+                    'eot_rewards': [float(r) for r in eot_rewards],
+                    'true reward': float(true_reward),
+                    'accuracy': float(acc),
+                    'variance': float(var)
+                }
+            )
 
-    print(f"Reward Estimate Variance: {variance:.4f}")
-    print(f"Reward Estimate Agreement: {agreement:.4f}")
+    all_var = np.mean([r['variance'] for r in eot_results])
+    all_acc = np.mean([r['accuracy'] for r in eot_results])
 
-    return {"variance": variance, "agreement": agreement}
+    print(f"Reward Estimate Variance: {all_var:.4f}")
+    print(f"Reward Estimate Accuracy: {all_acc:.4f}")
 
+    return {"variance": all_var, "accuracy": all_acc, 'eot_results': eot_results}
 
 
 import os
@@ -253,7 +278,8 @@ def run_sft_experiments(
 
                 # Compute variance and pairwise agreement
                 variance = all_rewards['variance']
-                agreement = all_rewards['agreement']
+                accuracy = all_rewards['accuracy']
+                eot_results = all_rewards['eot_results']
 
                 # Store results
                 results.append({
@@ -261,7 +287,8 @@ def run_sft_experiments(
                     "seed": seed,
                     "data_size": data_size,
                     "variance": variance,
-                    "agreement": agreement,
+                    "accuracy": accuracy,
+                    'results': eot_results 
                 })
 
                 with open('sft_results.json', 'w') as f:
