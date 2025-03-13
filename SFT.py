@@ -119,7 +119,6 @@ def train_sft_reward_model(model, train_path, val_path, tokenizer, best_path, ep
         total_val_loss = 0
 
         with torch.no_grad():
-            i = 0
             for batch in tqdm(val_loader):
                 input_ids = batch["input_ids"].to(device)
                 attention_mask = batch["attention_mask"].to(device)
@@ -129,9 +128,6 @@ def train_sft_reward_model(model, train_path, val_path, tokenizer, best_path, ep
                 loss = get_loss(input_ids, rewards, predicted_rewards)
                 total_val_loss += loss.item()
 
-                i += 1
-                if i > 5:
-                    break
 
         avg_val_loss = total_val_loss / len(val_loader)
 
@@ -162,13 +158,9 @@ def evaluate_sft_reward_model(model, eval_path, tokenizer, device="cuda"):
     eot_results = []
 
     with torch.no_grad():
-        i = 0
         for batch in tqdm(eval_loader):
-            i += 1
-
-            if i > 10:
-                break
             input_ids = batch["input_ids"].to(device)
+            input_hash = hash(input_ids)
             attention_mask = batch["attention_mask"].to(device)
             predicted_rewards = model(input_ids, attention_mask).squeeze().cpu().numpy()
             eot_idxs = torch.argwhere(input_ids.squeeze() == 198).squeeze()
@@ -186,7 +178,8 @@ def evaluate_sft_reward_model(model, eval_path, tokenizer, device="cuda"):
                     'eot_rewards': [float(r) for r in eot_rewards],
                     'true reward': float(true_reward),
                     'accuracy': float(acc),
-                    'variance': float(var)
+                    'variance': float(var),
+                    'input_hash': input_hash
                 }
             )
 
