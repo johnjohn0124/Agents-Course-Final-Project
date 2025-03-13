@@ -65,6 +65,18 @@ class SFTRewardModel(nn.Module):
         return reward.squeeze(-1)  # Output shape: (batch_size,)
 
 
+def get_loss(input_ids, rewards, predicted_rewards, pad_token_id=50256):
+    criterion = nn.BCEWithLogitsLoss(reduction='none')  # Binary classification loss
+    rewards_mask = (input_ids != pad_token_id)
+    rewards_expanded = rewards.unsqueeze(1).expand(-1, input_ids.shape[1]).float()
+
+    loss_unmasked = criterion(predicted_rewards, rewards_expanded)
+    loss_masked = loss_unmasked * rewards_mask.float()
+    loss = loss_masked.sum() / rewards_mask.float().sum()
+
+    return loss
+
+
 def train_sft_reward_model(model, train_path, val_path, tokenizer, best_path, epochs=3, batch_size=4, lr=2e-5, device="cuda"):
     """
     Train the SFT reward model on the 20Q dataset.
@@ -76,7 +88,6 @@ def train_sft_reward_model(model, train_path, val_path, tokenizer, best_path, ep
 
     model.to(device)
     optimizer = optim.AdamW(model.parameters(), lr=lr)
-    criterion = nn.BCEWithLogitsLoss(reduction='none')  # Binary classification loss
 
     best_val_loss = float('inf')
 
@@ -90,15 +101,10 @@ def train_sft_reward_model(model, train_path, val_path, tokenizer, best_path, ep
             rewards = batch["reward"].to(device)
 
             # the pad token id
-            rewards_mask = (input_ids != 50256)
-            rewards_expanded = rewards.unsqueeze(1).expand(-1, input_ids.shape[1]).float()
 
             optimizer.zero_grad()
             predicted_rewards = model(input_ids, attention_mask)
-
-            loss_unmasked = criterion(predicted_rewards, rewards_expanded)
-            loss_masked = loss_unmasked * rewards_mask.float()
-            loss = loss_masked.sum() / rewards_mask.float().sum()
+            loss = get_loss(input_ids, rewards, predicted_rewards)
             loss.backward()
             optimizer.step()
 
@@ -118,8 +124,7 @@ def train_sft_reward_model(model, train_path, val_path, tokenizer, best_path, ep
                 rewards = batch["reward"].to(device)
 
                 predicted_rewards = model(input_ids, attention_mask)
-                loss = criterion(predicted_rewards, rewards)
-
+                loss = get_loss(input_ids, rewards, predicted_rewards)
                 total_val_loss += loss.item()
 
         avg_val_loss = total_val_loss / len(val_loader)
@@ -149,15 +154,11 @@ def evaluate_sft_reward_model(model, eval_path, tokenizer, device="cuda"):
     all_rewards = []
 
     with torch.no_grad():
-        i = 0
         for batch in tqdm(eval_loader):
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
             predicted_rewards = model(input_ids, attention_mask).cpu().numpy()
             all_rewards.append(predicted_rewards)
-            i += 1
-            if i == 5:
-                break
 
     all_rewards = np.array(all_rewards)
     all_rewards = torch.from_numpy(all_rewards).permute(1, 0, 2).squeeze(dim=0)
